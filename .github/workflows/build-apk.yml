@@ -1,0 +1,270 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag yang berisi source zip"
+        required: true
+      build_type:
+        description: "debug atau release"
+        required: true
+        default: "release"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      type: ${{ steps.locate.outputs.type }}
+      dir: ${{ steps.locate.outputs.dir }}
+      versions: ${{ steps.pick.outputs.versions }}
+    steps:
+      - name: Download source zip dari release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          gh release download "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.zip" \
+            --dir source
+
+      - name: Extract project
+        run: |
+          set -euo pipefail
+          mkdir -p project
+          cd source
+          ZIPFILE=$(ls -- *.zip | head -n1)
+          if [ -z "$ZIPFILE" ]; then
+            echo "::error::Tidak ada file .zip di dalam release ini."
+            exit 1
+          fi
+          set +e
+          unzip -q "$ZIPFILE" -d ../project
+          status=$?
+          set -e
+          if [ "$status" -gt 1 ]; then
+            echo "::error::unzip gagal dengan exit code $status"
+            exit "$status"
+          fi
+
+      # Support "all base zip": entah pubspec.yaml/gradlew ada di root zip
+      # atau terbungkus di dalam satu/dua folder, tetap ditemukan otomatis.
+      - name: Deteksi jenis project
+        id: locate
+        run: |
+          set -euo pipefail
+          PUBSPEC_DIR=$(find project -maxdepth 6 -iname "pubspec.yaml" -printf '%d\t%h\n' | sort -n | cut -f2 | head -n1)
+          if [ -n "$PUBSPEC_DIR" ]; then
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            echo "dir=$PUBSPEC_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Cari gradlew lebih dalam (maxdepth 5, bukan 3) karena beberapa zip
+          # native Android terbungkus 1-2 folder ekstra (mis. hasil "Download
+          # ZIP" dari GitHub yang otomatis nambah folder <repo>-<branch>/).
+          GRADLEW_DIR=$(find project -maxdepth 5 -iname "gradlew" -printf '%d\t%h\n' | sort -n | cut -f2 | head -n1)
+          if [ -n "$GRADLEW_DIR" ]; then
+            echo "type=native" >> "$GITHUB_OUTPUT"
+            echo "dir=$GRADLEW_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Tidak ditemukan pubspec.yaml (Flutter) maupun gradlew (native Android) di dalam zip! Pastikan zip berisi project yang valid, bukan cuma source code lepas."
+          exit 1
+
+      # Auto-detect versi Flutter dari constraint di pubspec.yaml:
+      #   - Versi EXACT (mis. "flutter: 3.19.0" atau "flutter: '3.19.0'"), pakai persis versi itu.
+      #   - Range/tidak ada versi -> build otomatis 2 versi sekaligus sebagai fallback:
+      #       "stable"  = versi Flutter terbaru
+      #       "3.41.6"  = rilis stable resmi terakhir sebelum IconData jadi final class
+      - name: Tentukan versi Flutter yang dipakai
+        id: pick
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.locate.outputs.type }}" != "flutter" ]; then
+            echo 'versions=["stable"]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PUBSPEC="${{ steps.locate.outputs.dir }}/pubspec.yaml"
+          # Tangkap versi exact walau dikutip dengan ' atau " atau tanpa kutip:
+          #   flutter: 3.19.0 / flutter: "3.19.0" / flutter: '3.19.0'
+          EXACT=$(grep -E "^\s*flutter:\s*[\"']?[0-9]+\.[0-9]+\.[0-9]+[\"']?\s*$" "$PUBSPEC" \
+            | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1 || true)
+
+          if [ -n "$EXACT" ]; then
+            echo "Ditemukan versi Flutter exact di pubspec.yaml: $EXACT"
+            echo "versions=[\"$EXACT\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tidak ada versi Flutter exact di pubspec.yaml, build otomatis: stable + 3.41.6"
+            echo 'versions=["stable","3.41.6"]' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload project sebagai artifact sementara
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-source
+          path: project
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        flutter_version: ${{ fromJson(needs.prepare.outputs.versions) }}
+    steps:
+      - name: Download project dari artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-source
+          path: project
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        if: needs.prepare.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ matrix.flutter_version != 'stable' && matrix.flutter_version || '' }}
+          cache: true
+
+      - name: Flutter pub get
+        if: needs.prepare.outputs.type == 'flutter'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: flutter pub get
+
+      - name: Build APK - Flutter (debug)
+        if: needs.prepare.outputs.type == 'flutter' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: flutter build apk --debug
+
+      - name: Build APK - Flutter (release)
+        if: needs.prepare.outputs.type == 'flutter' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Build APK - Native Gradle (debug)
+        if: needs.prepare.outputs.type == 'native' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Build APK - Native Gradle (release)
+        if: needs.prepare.outputs.type == 'native' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Cari file APK hasil build
+        id: apk
+        run: |
+          set -euo pipefail
+          # Prioritaskan APK di folder outputs/apk standar (hindari nyangkut
+          # APK intermediate/unaligned di folder build lain), fallback ke
+          # pencarian umum kalau tidak ketemu di path standar.
+          APK_PATH=$(find "${{ needs.prepare.outputs.dir }}" -path "*/outputs/*apk*" -name "*.apk" 2>/dev/null | head -n1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find "${{ needs.prepare.outputs.dir }}" -name "*.apk" | head -n1)
+          fi
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::File APK hasil build tidak ditemukan!"
+            exit 1
+          fi
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-apk-${{ matrix.flutter_version }}
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 1
+          if-no-files-found: error
+
+  finalize:
+    needs: [prepare, build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Download semua APK hasil build (per versi)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: built-apk-*
+          path: all-apks
+        continue-on-error: true
+
+      # Prioritas: pakai hasil build "stable" dulu kalau berhasil,
+      # kalau tidak ada / gagal, pakai versi lain yang berhasil (mis. 3.41.6).
+      - name: Pilih satu APK yang berhasil dibuild
+        id: choose
+        run: |
+          set -euo pipefail
+          CHOSEN=""
+          CHOSEN_NAME=""
+
+          if [ -d "all-apks/built-apk-stable" ]; then
+            APK=$(find "all-apks/built-apk-stable" -name "*.apk" | head -n1)
+            if [ -n "$APK" ]; then
+              CHOSEN="$APK"
+              CHOSEN_NAME="built-apk-stable"
+            fi
+          fi
+
+          if [ -z "$CHOSEN" ] && [ -d "all-apks" ]; then
+            for d in all-apks/*/; do
+              [ -d "$d" ] || continue
+              APK=$(find "$d" -name "*.apk" | head -n1)
+              if [ -n "$APK" ]; then
+                CHOSEN="$APK"
+                CHOSEN_NAME=$(basename "$d")
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$CHOSEN" ]; then
+            echo "::error::Tidak ada APK yang berhasil dibuild dari versi manapun! Cek log job 'build' untuk detail error tiap versi."
+            exit 1
+          fi
+
+          echo "Menggunakan hasil build: $CHOSEN_NAME"
+          cp "$CHOSEN" ./final.apk
+          echo "path=final.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK final (satu-satunya)
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-apk
+          path: ${{ steps.choose.outputs.path }}
+          retention-days: 1
+
+      - name: Hapus artifact sementara
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "project-source" or (.name | startswith("built-apk-"))) | .id' \
+          | while read -r id; do
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+            done
