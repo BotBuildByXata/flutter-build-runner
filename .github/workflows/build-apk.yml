@@ -53,12 +53,28 @@ jobs:
             exit "$status"
           fi
 
-      # Support "all base zip": entah pubspec.yaml/gradlew ada di root zip
-      # atau terbungkus di dalam satu/dua folder, tetap ditemukan otomatis.
+      - name: Fix permissions setelah extract
+        run: |
+          set -euo pipefail
+          chmod -R a+rX project
+
+      # Urutan deteksi penting: cek marker paling spesifik dulu supaya
+      # tidak salah tebak (mis. project Ionic juga punya package.json
+      # sama seperti Capacitor/React Native/Cordova).
       - name: Deteksi jenis project
         id: locate
         run: |
           set -euo pipefail
+
+          # 1. Smali / APKTool -> ditandai file apktool.yml hasil decompile
+          APKTOOL_DIR=$(find project -maxdepth 6 -iname "apktool.yml" -printf '%d\t%h\n' | sort -n | cut -f2 | head -n1)
+          if [ -n "$APKTOOL_DIR" ]; then
+            echo "type=smali" >> "$GITHUB_OUTPUT"
+            echo "dir=$APKTOOL_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. Flutter -> pubspec.yaml
           PUBSPEC_DIR=$(find project -maxdepth 6 -iname "pubspec.yaml" -printf '%d\t%h\n' | sort -n | cut -f2 | head -n1)
           if [ -n "$PUBSPEC_DIR" ]; then
             echo "type=flutter" >> "$GITHUB_OUTPUT"
@@ -66,9 +82,38 @@ jobs:
             exit 0
           fi
 
-          # Cari gradlew lebih dalam (maxdepth 5, bukan 3) karena beberapa zip
-          # native Android terbungkus 1-2 folder ekstra (mis. hasil "Download
-          # ZIP" dari GitHub yang otomatis nambah folder <repo>-<branch>/).
+          # 3. Project berbasis Node: Cordova / Ionic / Capacitor / React Native
+          # dibedakan lewat isi package.json + file konfigurasi khasnya.
+          PKG_DIR=$(find project -maxdepth 4 -iname "package.json" -printf '%d\t%h\n' | sort -n | cut -f2 | head -n1)
+          if [ -n "$PKG_DIR" ]; then
+            PKG="$PKG_DIR/package.json"
+
+            if [ -f "$PKG_DIR/config.xml" ] || grep -q '"cordova"' "$PKG"; then
+              echo "type=cordova" >> "$GITHUB_OUTPUT"
+              echo "dir=$PKG_DIR" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ -f "$PKG_DIR/ionic.config.json" ] || grep -qE '"@ionic/(angular|react|vue|core)"' "$PKG"; then
+              echo "type=ionic" >> "$GITHUB_OUTPUT"
+              echo "dir=$PKG_DIR" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ -f "$PKG_DIR/capacitor.config.json" ] || [ -f "$PKG_DIR/capacitor.config.ts" ] || grep -q '"@capacitor/core"' "$PKG"; then
+              echo "type=capacitor" >> "$GITHUB_OUTPUT"
+              echo "dir=$PKG_DIR" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if grep -q '"react-native"' "$PKG"; then
+              echo "type=react-native" >> "$GITHUB_OUTPUT"
+              echo "dir=$PKG_DIR" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # 4. Native Android murni (gradlew tanpa layer JS/Flutter di atasnya)
           GRADLEW_DIR=$(find project -maxdepth 5 -iname "gradlew" -printf '%d\t%h\n' | sort -n | cut -f2 | head -n1)
           if [ -n "$GRADLEW_DIR" ]; then
             echo "type=native" >> "$GITHUB_OUTPUT"
@@ -76,26 +121,21 @@ jobs:
             exit 0
           fi
 
-          echo "::error::Tidak ditemukan pubspec.yaml (Flutter) maupun gradlew (native Android) di dalam zip! Pastikan zip berisi project yang valid, bukan cuma source code lepas."
+          echo "::error::Jenis project tidak dikenali. Pastikan zip berisi salah satu: Flutter (pubspec.yaml), Android Native (gradlew), Smali/APKTool (apktool.yml), atau React Native/Ionic/Capacitor/Cordova (package.json)."
           exit 1
 
-      # Auto-detect versi Flutter dari constraint di pubspec.yaml:
-      #   - Versi EXACT (mis. "flutter: 3.19.0" atau "flutter: '3.19.0'"), pakai persis versi itu.
-      #   - Range/tidak ada versi -> build otomatis 2 versi sekaligus sebagai fallback:
-      #       "stable"  = versi Flutter terbaru
-      #       "3.41.6"  = rilis stable resmi terakhir sebelum IconData jadi final class
-      - name: Tentukan versi Flutter yang dipakai
+      # Auto-detect versi Flutter dari constraint di pubspec.yaml (hanya
+      # relevan untuk type=flutter). Untuk jenis lain, cukup 1 build "default".
+      - name: Tentukan versi build yang dipakai
         id: pick
         run: |
           set -euo pipefail
           if [ "${{ steps.locate.outputs.type }}" != "flutter" ]; then
-            echo 'versions=["stable"]' >> "$GITHUB_OUTPUT"
+            echo 'versions=["default"]' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           PUBSPEC="${{ steps.locate.outputs.dir }}/pubspec.yaml"
-          # Tangkap versi exact walau dikutip dengan ' atau " atau tanpa kutip:
-          #   flutter: 3.19.0 / flutter: "3.19.0" / flutter: '3.19.0'
           EXACT=$(grep -E "^\s*flutter:\s*[\"']?[0-9]+\.[0-9]+\.[0-9]+[\"']?\s*$" "$PUBSPEC" \
             | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1 || true)
 
@@ -122,7 +162,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flutter_version: ${{ fromJson(needs.prepare.outputs.versions) }}
+        build_version: ${{ fromJson(needs.prepare.outputs.versions) }}
     steps:
       - name: Download project dari artifact
         uses: actions/download-artifact@v4
@@ -136,14 +176,21 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
+      - name: Setup Node.js
+        if: contains(fromJson('["react-native","ionic","capacitor","cordova"]'), needs.prepare.outputs.type)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Setup Flutter
         if: needs.prepare.outputs.type == 'flutter'
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version: ${{ matrix.flutter_version != 'stable' && matrix.flutter_version || '' }}
+          flutter-version: ${{ matrix.build_version != 'stable' && matrix.build_version || '' }}
           cache: true
 
+      # ---------- FLUTTER ----------
       - name: Flutter pub get
         if: needs.prepare.outputs.type == 'flutter'
         working-directory: ${{ needs.prepare.outputs.dir }}
@@ -159,6 +206,7 @@ jobs:
         working-directory: ${{ needs.prepare.outputs.dir }}
         run: flutter build apk --release --no-tree-shake-icons
 
+      # ---------- ANDROID NATIVE ----------
       - name: Build APK - Native Gradle (debug)
         if: needs.prepare.outputs.type == 'native' && github.event.inputs.build_type == 'debug'
         working-directory: ${{ needs.prepare.outputs.dir }}
@@ -173,17 +221,148 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
 
+      # ---------- REACT NATIVE ----------
+      - name: Install dependencies (React Native)
+        if: needs.prepare.outputs.type == 'react-native'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: npm install
+
+      - name: Build APK - React Native (debug)
+        if: needs.prepare.outputs.type == 'react-native' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Build APK - React Native (release)
+        if: needs.prepare.outputs.type == 'react-native' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      # ---------- CAPACITOR ----------
+      - name: Install dependencies (Capacitor)
+        if: needs.prepare.outputs.type == 'capacitor'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: |
+          npm install
+          npm run build || true
+          npx cap sync android
+
+      - name: Build APK - Capacitor (debug)
+        if: needs.prepare.outputs.type == 'capacitor' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Build APK - Capacitor (release)
+        if: needs.prepare.outputs.type == 'capacitor' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      # ---------- IONIC (asumsi native layer = Capacitor) ----------
+      - name: Install dependencies (Ionic)
+        if: needs.prepare.outputs.type == 'ionic'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: |
+          npm install
+          npm run build || true
+          npx cap sync android
+
+      - name: Build APK - Ionic (debug)
+        if: needs.prepare.outputs.type == 'ionic' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Build APK - Ionic (release)
+        if: needs.prepare.outputs.type == 'ionic' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      # ---------- CORDOVA ----------
+      - name: Install dependencies (Cordova)
+        if: needs.prepare.outputs.type == 'cordova'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: |
+          npm install
+          npm install -g cordova
+          cordova platform add android || true
+
+      - name: Build APK - Cordova (debug)
+        if: needs.prepare.outputs.type == 'cordova' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: cordova build android --debug
+
+      - name: Build APK - Cordova (release)
+        if: needs.prepare.outputs.type == 'cordova' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ needs.prepare.outputs.dir }}
+        run: cordova build android --release
+
+      # ---------- SMALI / APKTOOL ----------
+      - name: Install APKTool
+        if: needs.prepare.outputs.type == 'smali'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y apktool || (
+            sudo wget -q -O /usr/local/bin/apktool https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool
+            sudo wget -q -O /usr/local/bin/apktool.jar https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar
+            sudo chmod +x /usr/local/bin/apktool /usr/local/bin/apktool.jar
+          )
+
+      - name: Build APK - Smali/APKTool (rebuild + sign debug key)
+        if: needs.prepare.outputs.type == 'smali'
+        run: |
+          set -euo pipefail
+          apktool b "${{ needs.prepare.outputs.dir }}" -o unsigned.apk
+
+          keytool -genkey -v -keystore debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n1)
+          "${BUILD_TOOLS}zipalign" -v -p 4 unsigned.apk aligned.apk
+          "${BUILD_TOOLS}apksigner" sign \
+            --ks debug.keystore --ks-pass pass:android \
+            --key-pass pass:android --ks-key-alias androiddebugkey \
+            --out final-smali.apk aligned.apk
+
+      # ---------- CARI HASIL APK ----------
       - name: Cari file APK hasil build
         id: apk
         run: |
           set -euo pipefail
-          # Prioritaskan APK di folder outputs/apk standar (hindari nyangkut
-          # APK intermediate/unaligned di folder build lain), fallback ke
-          # pencarian umum kalau tidak ketemu di path standar.
-          APK_PATH=$(find "${{ needs.prepare.outputs.dir }}" -path "*/outputs/*apk*" -name "*.apk" 2>/dev/null | head -n1)
+          TYPE="${{ needs.prepare.outputs.type }}"
+          DIR="${{ needs.prepare.outputs.dir }}"
+          APK_PATH=""
+
+          case "$TYPE" in
+            smali)
+              APK_PATH="final-smali.apk"
+              ;;
+            cordova)
+              APK_PATH=$(find "$DIR/platforms/android" -path "*/outputs/*apk*" -name "*.apk" 2>/dev/null | head -n1)
+              ;;
+            react-native|capacitor|ionic)
+              APK_PATH=$(find "$DIR/android" -path "*/outputs/*apk*" -name "*.apk" 2>/dev/null | head -n1)
+              ;;
+            *)
+              APK_PATH=$(find "$DIR" -path "*/outputs/*apk*" -name "*.apk" 2>/dev/null | head -n1)
+              ;;
+          esac
+
           if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find "${{ needs.prepare.outputs.dir }}" -name "*.apk" | head -n1)
+            APK_PATH=$(find . -name "*.apk" 2>/dev/null | grep -v "/source/" | head -n1)
           fi
+
           if [ -z "$APK_PATH" ]; then
             echo "::error::File APK hasil build tidak ditemukan!"
             exit 1
@@ -193,7 +372,7 @@ jobs:
       - name: Upload APK sebagai artifact
         uses: actions/upload-artifact@v4
         with:
-          name: built-apk-${{ matrix.flutter_version }}
+          name: built-apk-${{ matrix.build_version }}
           path: ${{ steps.apk.outputs.path }}
           retention-days: 1
           if-no-files-found: error
@@ -213,8 +392,6 @@ jobs:
           path: all-apks
         continue-on-error: true
 
-      # Prioritas: pakai hasil build "stable" dulu kalau berhasil,
-      # kalau tidak ada / gagal, pakai versi lain yang berhasil (mis. 3.41.6).
       - name: Pilih satu APK yang berhasil dibuild
         id: choose
         run: |
